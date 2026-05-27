@@ -1,19 +1,15 @@
-//! # bc-forge Admin Module
-//!
 //! Reusable access-control primitives for Soroban contracts.
-//! Provides admin storage, authentication guards, role management, and multi-signature constraints.
 
 #![no_std]
 
 use soroban_sdk::{contracttype, Address, Env, String, Vec, vec};
+use soroban_sdk::{contracttype, vec, Address, Env, String, Vec};
 
-/// Storage keys used by the admin module.
 #[derive(Clone)]
 #[contracttype]
 pub enum AdminKey {
     /// The contract administrator address (singular, legacy primary admin).
     Admin,
-    /// Role assignments: (Role, Address) -> bool
     Role(Role, Address),
     /// Multi-sig required for specific critical actions: CriticalAction -> bool
     MultiSigRequired(CriticalAction),
@@ -59,31 +55,36 @@ pub enum CriticalAction {
     TransferOwnership = 7,
 }
 
-/// A proposal for a multi-signature action.
+/// Enumeration of available roles.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[contracttype]
+pub enum Role {
+    /// Global administrator with full control.
+    Admin,
+    /// Account authorized to mint tokens.
+    Minter,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
 pub struct Proposal {
-    /// The admin who created the proposal.
     pub creator: Address,
     /// The type of critical action this proposal addresses.
     pub action_type: CriticalAction,
     /// Description or metadata about the proposal.
     pub description: String,
-    /// List of admins who have approved this proposal.
     pub approvals: Vec<Address>,
-    /// Whether the proposal has been executed.
     pub executed: bool,
 }
 
-// ─── Read / Write ────────────────────────────────────────────────────────────
-
-/// Stores the admin address in instance storage.
 pub fn set_admin(env: &Env, admin: &Address) {
     env.storage().instance().set(&AdminKey::Admin, admin);
     grant_role(env, Role::Admin, admin);
+    env.storage()
+        .persistent()
+        .set(&AdminKey::Role(Role::Admin, admin.clone()), &true);
 }
 
-/// Retrieves the current admin address.
 pub fn get_admin(env: &Env) -> Address {
     env.storage()
         .instance()
@@ -91,7 +92,6 @@ pub fn get_admin(env: &Env) -> Address {
         .expect("contract not initialized: admin not set")
 }
 
-/// Returns `true` if an admin address has been configured.
 pub fn has_admin(env: &Env) -> bool {
     env.storage().instance().has(&AdminKey::Admin)
 }
@@ -106,7 +106,6 @@ pub fn grant_role(env: &Env, role: Role, address: &Address) {
         .set(&AdminKey::Role(role, address.clone()), &true);
 }
 
-/// Revokes a role from an address. Only callable by an Admin.
 pub fn revoke_role(env: &Env, role: Role, address: &Address) {
     require_admin(env);
     env.storage()
@@ -114,7 +113,6 @@ pub fn revoke_role(env: &Env, role: Role, address: &Address) {
         .remove(&AdminKey::Role(role, address.clone()));
 }
 
-/// Returns `true` if the address has the specified role.
 pub fn has_role(env: &Env, role: Role, address: &Address) -> bool {
     if env
         .storage()
@@ -134,6 +132,24 @@ pub fn has_role(env: &Env, role: Role, address: &Address) -> bool {
 ///
 /// When a pool is configured, every member receives the Admin role and the first
 /// pool member becomes the legacy primary admin for backward compatibility.
+// ─── Guards ──────────────────────────────────────────────────────────────────
+
+/// Requires that the stored admin has authorized the current invocation.
+pub fn require_admin(env: &Env) {
+    let admin = get_admin(env);
+    admin.require_auth();
+}
+
+/// Requires that the specified address has the given role and has authorized the invocation.
+pub fn require_role(env: &Env, role: Role, address: &Address) {
+    if !has_role(env, role, address) {
+        panic!("unauthorized: missing role");
+    }
+    address.require_auth();
+}
+
+// ─── Multi-Sig Primitives ───────────────────────────────────────────────────
+
 pub fn set_admin_pool(env: &Env, pool: Vec<Address>, threshold: u32) {
     if pool.is_empty() {
         panic!("admin pool cannot be empty");
@@ -158,9 +174,11 @@ pub fn set_admin_pool(env: &Env, pool: Vec<Address>, threshold: u32) {
                 .set(&AdminKey::Role(Role::Admin, member.clone()), &true);
         }
     }
+    env.storage()
+        .instance()
+        .set(&AdminKey::Threshold, &threshold);
 }
 
-/// Retrieves the admin pool. Defaults to the singular admin if no pool is set.
 pub fn get_admin_pool(env: &Env) -> Vec<Address> {
     env.storage()
         .instance()
@@ -174,7 +192,6 @@ pub fn get_admin_pool(env: &Env) -> Vec<Address> {
         })
 }
 
-/// Retrieves the quorum threshold for the admin pool.
 pub fn get_threshold(env: &Env) -> u32 {
     env.storage().instance().get(&AdminKey::Threshold).unwrap_or(1)
 }
@@ -275,6 +292,12 @@ pub fn require_multi_sig_with_caller(
     }
 }
 
+    env.storage()
+        .instance()
+        .get(&AdminKey::Threshold)
+        .unwrap_or(1)
+}
+
 // ─── Proposals ──────────────────────────────────────────────────────────────
 
 /// Creates a new proposal for an administrative action.
@@ -306,11 +329,12 @@ pub fn create_proposal(
         executed: false,
     };
 
-    env.storage().instance().set(&AdminKey::Proposal(id), &proposal);
+    env.storage()
+        .instance()
+        .set(&AdminKey::Proposal(id), &proposal);
     id
 }
 
-/// Adds an approval to an existing proposal.
 pub fn approve_proposal(env: &Env, admin: Address, proposal_id: u64) {
     admin.require_auth();
     if !is_pool_member(env, &admin) {
@@ -336,7 +360,6 @@ pub fn approve_proposal(env: &Env, admin: Address, proposal_id: u64) {
         .set(&AdminKey::Proposal(proposal_id), &proposal);
 }
 
-/// Checks if a proposal has met its quorum threshold.
 pub fn is_proposal_ready(env: &Env, proposal_id: u64) -> bool {
     let proposal: Proposal = env
         .storage()
@@ -346,7 +369,6 @@ pub fn is_proposal_ready(env: &Env, proposal_id: u64) -> bool {
     proposal.approvals.len() >= get_threshold(env)
 }
 
-/// Marks a proposal as executed. Useful for preventing re-execution.
 pub fn mark_executed(env: &Env, proposal_id: u64) {
     let mut proposal: Proposal = env
         .storage()
@@ -662,4 +684,9 @@ mod tests {
 
         client.require_ms(&CriticalAction::PauseContract, &id);
     }
+
+    proposal.executed = true;
+    env.storage()
+        .instance()
+        .set(&AdminKey::Proposal(proposal_id), &proposal);
 }
