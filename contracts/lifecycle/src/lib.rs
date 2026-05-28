@@ -6,7 +6,7 @@
 
 #![no_std]
 
-use soroban_sdk::{contracttype, Address, Env};
+use soroban_sdk::{contracttype, Address, BytesN, Env};
 
 /// Storage keys for lifecycle state.
 #[derive(Clone)]
@@ -50,6 +50,18 @@ pub fn unpause(env: Env, admin: Address) {
     env.storage().instance().set(&LifecycleKey::Paused, &false);
 }
 
+/// Upgrades the contract WASM code. Only callable by the deployer.
+///
+/// # Arguments
+/// * `env`            - The Soroban environment.
+/// * `new_wasm_hash`  - The hash of the new WASM code to deploy.
+///
+/// # Panics
+/// Panics if the caller is not the deployer.
+pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+    env.deployer().update_current_contract_wasm(new_wasm_hash);
+}
+
 /// Returns `true` if the contract is currently paused.
 pub fn is_paused(env: &Env) -> bool {
     env.storage()
@@ -86,6 +98,9 @@ mod tests {
         }
         pub fn unpause(env: Env, admin: Address) {
             super::unpause(env, admin);
+        }
+        pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+            super::upgrade(env, new_wasm_hash);
         }
         pub fn is_paused(env: Env) -> bool {
             super::is_paused(&env)
