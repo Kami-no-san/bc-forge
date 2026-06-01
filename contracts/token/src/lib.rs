@@ -53,6 +53,12 @@ pub enum DataKey {
     Lockup(Address),
     /// Associated action for a proposal ID.
     ProposalAction(u64),
+    /// Treasury address for collected fees
+    Treasury,
+    /// Fee configuration
+    FeeConfig,
+    /// Fee exemptions
+    FeeExemption(Address),
 }
 
 /// Information about a token lockup/vesting.
@@ -147,37 +153,25 @@ impl BcForgeToken {
 
     /// Reads the balance for a given address, defaulting to 0.
     fn read_balance(env: &Env, id: &Address) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Balance(id.clone()))
-            .unwrap_or(0)
+        let key = DataKey::Balance(id.clone());
+        if env.storage().persistent().has(&key) {
+            Self::extend_balance_ttl(env, id);
+        }
+        env.storage().persistent().get(&key).unwrap_or(0)
     }
 
     /// Writes a balance for a given address.
     fn write_balance(env: &Env, id: &Address, balance: i128) {
-        env.storage()
-            .persistent()
-            .set(&DataKey::Balance(id.clone()), &balance);
+        let key = DataKey::Balance(id.clone());
+        env.storage().persistent().set(&key, &balance);
+        Self::extend_balance_ttl(env, id);
     }
 
     /// Reads the spending allowance for (owner → spender), defaulting to 0.
     /// Returns 0 if the allowance has expired.
     fn read_allowance(env: &Env, from: &Address, spender: &Address) -> i128 {
-        let allowance_info: AllowanceInfo = env.storage()
-            .persistent()
-            .get(&DataKey::Allowance(from.clone(), spender.clone()))
-            .unwrap_or(AllowanceInfo { amount: 0, exp_ledger: 0 });
-        
-        // Check if allowance has expired
-        if allowance_info.exp_ledger > 0 {
-            let current_ledger = env.ledger().sequence();
-            if current_ledger > allowance_info.exp_ledger as u64 {
-                return 0; // Allowance expired
-            }
-        }
-        
-        allowance_info.amount
-        if let Some(exp_ledger) = env
+        let key = DataKey::Allowance(from.clone(), spender.clone());
+        let allowance_info: AllowanceInfo = env
             .storage()
             .persistent()
             .get(&DataKey::Allowance(from.clone(), spender.clone()))
@@ -196,20 +190,17 @@ impl BcForgeToken {
 
     /// Writes a spending allowance for (owner → spender).
     fn write_allowance(env: &Env, from: &Address, spender: &Address, amount: i128, exp: u32) {
+        let key = DataKey::Allowance(from.clone(), spender.clone());
         let allowance_info = AllowanceInfo { amount, exp_ledger: exp };
-        env.storage()
-            .persistent()
-            .set(&DataKey::Allowance(from.clone(), spender.clone()), &allowance_info);
+        env.storage().persistent().set(&key, &allowance_info);
+        Self::extend_allowance_ttl(env, from, spender);
     }
 
     /// Reads the full allowance info for (owner → spender), defaulting to zero allowance with no expiration.
     fn read_allowance_info(env: &Env, from: &Address, spender: &Address) -> AllowanceInfo {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Allowance(from.clone(), spender.clone()))
-            .unwrap_or(AllowanceInfo { amount: 0, exp_ledger: 0 })
-            .set(&DataKey::Allowance(from.clone(), spender.clone()), &amount);
-        env.storage()
+        let key = DataKey::Allowance(from.clone(), spender.clone());
+        let info = env
+            .storage()
             .persistent()
             .get(&DataKey::Allowance(from.clone(), spender.clone()))
             .unwrap_or(AllowanceInfo { amount: 0, exp_ledger: 0 })
@@ -241,12 +232,17 @@ impl BcForgeToken {
 
     /// Reads the total supply, defaulting to 0.
     fn read_supply(env: &Env) -> i128 {
-        env.storage().instance().get(&DataKey::Supply).unwrap_or(0)
+        let key = DataKey::Supply;
+        if env.storage().instance().has(&key) {
+            ttl::extend_instance_ttl(env);
+        }
+        env.storage().instance().get(&key).unwrap_or(0)
     }
 
     /// Writes the total supply.
     fn write_supply(env: &Env, supply: i128) {
         env.storage().instance().set(&DataKey::Supply, &supply);
+        ttl::extend_instance_ttl(env);
     }
 
     /// Reads the admin address via the admin module.
@@ -271,7 +267,108 @@ impl BcForgeToken {
 
     /// Reads the pending admin address (if any).
     fn read_pending_admin(env: &Env) -> Option<Address> {
-        env.storage().instance().get(&DataKey::PendingAdmin)
+        let key = DataKey::PendingAdmin;
+        if env.storage().instance().has(&key) {
+            ttl::extend_instance_ttl(env);
+        }
+        env.storage().instance().get(&key)
+    }
+
+    fn read_treasury(env: &Env) -> Result<Address, TokenError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Treasury)
+            .ok_or(TokenError::FeeNotConfigured)
+    }
+
+    fn read_fee_config(env: &Env) -> Result<FeeConfig, TokenError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::FeeConfig)
+            .ok_or(TokenError::FeeNotConfigured)
+    }
+
+    fn read_fee_exemption(env: &Env, address: &Address) -> Option<FeeExemption> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FeeExemption(address.clone()))
+    }
+
+    fn is_fee_exempt(env: &Env, address: &Address, operation_type: u8) -> bool {
+        if let Some(exemption) = Self::read_fee_exemption(env, address) {
+            // 0 = all operations, 1 = transfers only, 2 = mint only, etc.
+            exemption.exemption_type == 0 || exemption.exemption_type == operation_type
+        } else {
+            false
+        }
+    }
+
+    fn calculate_fee(env: &Env, operation_type: u8, complexity: u32) -> i128 {
+        let fee_config = match Self::read_fee_config(env) {
+            Ok(config) => config,
+            Err(_) => return 0,
+        };
+
+        if !fee_config.enabled {
+            return 0;
+        }
+
+        // Base fee + (complexity * multiplier)
+        let base_fee = fee_config.base_fee;
+        let multiplier = fee_config.complexity_multiplier as i128;
+        let complexity_fee = (complexity as i128) * multiplier;
+        
+        let total_fee = base_fee + complexity_fee;
+        
+        // Cap at max_fee
+        if total_fee > fee_config.max_fee {
+            fee_config.max_fee
+        } else {
+            total_fee
+        }
+    }
+
+    fn charge_fee(env: &Env, payer: &Address, operation_type: u8, complexity: u32) -> Result<(), TokenError> {
+        // Check if payer is exempt
+        if Self::is_fee_exempt(env, payer, operation_type) {
+            return Ok(());
+        }
+
+        let fee_amount = Self::calculate_fee(env, operation_type, complexity);
+        if fee_amount == 0 {
+            return Ok(());
+        }
+
+        // Get treasury address
+        let treasury = Self::read_treasury(env)?;
+
+        // Check if payer has sufficient balance for fee
+        let payer_balance = Self::read_balance(env, payer);
+        if payer_balance < fee_amount {
+            return Err(TokenError::InsufficientFeeBalance);
+        }
+
+        // Transfer fee to treasury
+        let _ = Self::move_balance(env, payer, &treasury, fee_amount)?;
+        
+        // Emit fee charged event
+        events::emit_fee_charged(env, payer, &treasury, fee_amount);
+        
+        Ok(())
+    }
+
+    fn set_fee_config(env: &Env, config: &FeeConfig) {
+        env.storage().instance().set(&DataKey::FeeConfig, config);
+    }
+
+    fn set_treasury(env: &Env, treasury: &Address) {
+        env.storage().instance().set(&DataKey::Treasury, treasury);
+    }
+
+    fn set_fee_exemption(env: &Env, address: &Address, exemption: &FeeExemption) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::FeeExemption(address.clone()), exemption);
     }
 }
 
@@ -341,6 +438,12 @@ impl BcForgeToken {
     pub fn execute_proposal(env: Env, proposal_id: u64) {
         bc_forge_admin::mark_executed(&env, proposal_id);
         let action: TokenAction = env.storage().instance().get(&DataKey::ProposalAction(proposal_id))
+        Self::extend_instance_ttl_for_call(&env);
+        admin::mark_executed(&env, proposal_id);
+        let action: TokenAction = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalAction(proposal_id))
             .expect("proposal action not found");
 
         match action {
@@ -470,6 +573,7 @@ impl BcForgeToken {
 
     /// Withdraws locked tokens past the release interval.
     pub fn withdraw_locked(env: Env, user: Address) {
+        Self::extend_instance_ttl_for_call(&env);
         user.require_auth();
         
         let lockup: LockupInfo = env.storage().persistent().get(&DataKey::Lockup(user.clone()))
@@ -547,6 +651,7 @@ impl BcForgeToken {
     /// # Returns
     /// Some(Address) if there is a pending admin, None otherwise.
     pub fn pending_owner(env: Env) -> Option<Address> {
+        Self::extend_instance_ttl_for_call(&env);
         Self::read_pending_admin(&env)
     }
 
@@ -583,6 +688,7 @@ impl BcForgeToken {
 
     /// Returns the contract version.
     pub fn version(env: Env) -> String {
+        Self::extend_instance_ttl_for_call(&env);
         String::from_str(&env, "1.1.0")
     }
 
@@ -681,12 +787,9 @@ impl TokenInterface for BcForgeToken {
             soroban_sdk::panic_with_error!(&env, TokenError::InsufficientAllowance);
         }
 
-        Self::move_balance(&env, &from, &to, amount);
-        // Preserve the original expiration
         let allowance_info = Self::read_allowance_info(&env, &from, &spender);
-        Self::write_allowance(&env, &from, &spender, allowance - amount, allowance_info.exp_ledger);
         let _ = Self::panic_on_err(&env, Self::move_balance(&env, &from, &to, amount));
-        Self::write_allowance(&env, &from, &spender, allowance - amount, 0);
+        Self::write_allowance(&env, &from, &spender, allowance - amount, allowance_info.exp_ledger);
         events::emit_transfer_from(&env, &spender, &from, &to, amount, allowance - amount);
     }
 
@@ -737,7 +840,6 @@ impl TokenInterface for BcForgeToken {
         // Preserve the original expiration
         let allowance_info = Self::read_allowance_info(&env, &from, &spender);
         Self::write_allowance(&env, &from, &spender, allowance - amount, allowance_info.exp_ledger);
-        Self::write_allowance(&env, &from, &spender, allowance - amount, 0);
         Self::write_balance(&env, &from, balance - amount);
 
         let supply = Self::read_supply(&env) - amount;
